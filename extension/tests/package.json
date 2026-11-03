@@ -1,0 +1,1 @@
+{"description":"Node tests for the SuperAgentic bridge extension (Elysium Browser Wallet provider + inject routing). No dependencies; mocked transport only, no keys, no daemon.","name":"superagentic-wallet-extension-tests","private":true,"scripts":{"test":"node test-elysium-provider.mjs && node test-inject-routing.mjs && node test-background-relay.mjs"},"version":"1.1.0"}

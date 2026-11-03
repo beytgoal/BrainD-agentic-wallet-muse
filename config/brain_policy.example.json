@@ -1,0 +1,60 @@
+{
+  "allowed_methods": [
+    "eth_sendTransaction",
+    "personal_sign",
+    "eth_signTypedData_v4"
+  ],
+  "chains": {
+    "amoy": {
+      "cap_wei": null,
+      "chain_id": "0x13882",
+      "class": "testnet"
+    },
+    "base": {
+      "cap_wei": null,
+      "chain_id": "0x2105",
+      "class": "mainnet"
+    },
+    "base-sepolia": {
+      "cap_wei": null,
+      "chain_id": "0x14a34",
+      "class": "testnet"
+    },
+    "bsc": {
+      "cap_wei": null,
+      "chain_id": "0x38",
+      "class": "mainnet"
+    },
+    "bsc-testnet": {
+      "cap_wei": null,
+      "chain_id": "0x61",
+      "class": "testnet"
+    },
+    "elysium": {
+      "cap_wei": null,
+      "chain_id": "0x185d9",
+      "class": "testnet"
+    },
+    "ethereum": {
+      "cap_wei": null,
+      "chain_id": "0x1",
+      "class": "mainnet"
+    },
+    "polygon": {
+      "cap_wei": null,
+      "chain_id": "0x89",
+      "class": "mainnet"
+    },
+    "sepolia": {
+      "cap_wei": null,
+      "chain_id": "0xaa36a7",
+      "class": "testnet"
+    }
+  },
+  "description": "Example Brain policy. Replace the destination allowlist and self address with your own before use.",
+  "destinations": {
+    "allowlist": [],
+    "self": "0x0000000000000000000000000000000000000000"
+  },
+  "version": 3
+}

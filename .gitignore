@@ -1,0 +1,18 @@
+# Secrets and local state — never commit these
+seed
+*.seed
+.env
+*.token
+walletd.token
+session.json
+brain_policy.json
+state/
+*.jsonl
+
+# Runtime noise
+__pycache__/
+*.pyc
+*.log
+*.out
+*.bak-*
+browser-profile*/
