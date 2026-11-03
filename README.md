@@ -71,6 +71,29 @@ python3 daemon/walletd.py
 python3 bin/wd.py balance --chain elysium
 ```
 
+## Self-hosting
+
+BrainD runs entirely on your own infrastructure — there is no central server.
+Two ways to install on a fresh VM:
+
+```bash
+# Docker
+mkdir -p braind-data/state
+umask 077; printf '%s' "<your BIP-39 mnemonic>" > braind-data/seed
+openssl rand -hex 32 > braind-data/walletd.token
+docker compose up -d
+
+# Native (Python 3.11+), with an interactive seed setup
+./install.sh            # add --systemd for a service
+```
+
+For anything beyond a single test machine, run the **signer on its own VM**
+and let agents propose intents to it over SSH or a private network — the seed
+then never touches the agent machine. Topology, configuration reference
+(everything is environment-driven: `BRAIND_SEED_FILE`, `BRAIND_TOKEN_FILE`,
+`BRAIND_STATE_DIR`, `BRAIND_BIND`, ports) and the security rules live in
+[docs/self-host.md](docs/self-host.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

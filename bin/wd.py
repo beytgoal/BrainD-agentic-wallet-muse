@@ -37,9 +37,17 @@ Chain: bsc | ethereum | base | polygon | elysium | sepolia | bsc-testnet | base-
 """
 import argparse, base64, json, os, sys, time, urllib.request, urllib.error
 
-WALLETD_HTTP = "http://127.0.0.1:18924/"
-WALLETD_TOKEN_FILE = os.path.expanduser("~/.burner/walletd.token")
-BURNER_EVM = "0x0000000000000000000000000000000000000000"
+WALLETD_HTTP = os.environ.get("BRAIND_WALLETD_URL", "http://127.0.0.1:18924/")
+WALLETD_TOKEN_FILE = os.environ.get("BRAIND_TOKEN_FILE", os.path.expanduser("~/.burner/walletd.token"))
+_BURNER_EVM = None
+
+def burner_evm():
+    """Alamat EVM daemon ini — ditanyakan ke walletd (eth_requestAccounts),
+    bukan konstanta tertanam. Override manual: BRAIND_SELF_ADDRESS."""
+    global _BURNER_EVM
+    if _BURNER_EVM is None:
+        _BURNER_EVM = os.environ.get("BRAIND_SELF_ADDRESS") or call_walletd("eth_requestAccounts")[0]
+    return _BURNER_EVM
 
 def walletd_headers():
     """Header HTTP walletd termasuk token pemanggil (2026-10-30).
@@ -113,7 +121,7 @@ def cmd_chains(_):
 
 def cmd_accounts(_):
     accts = call_walletd("eth_requestAccounts")
-    out({"accounts": accts, "burner_match": bool(accts) and accts[0].lower() == BURNER_EVM.lower()})
+    out({"accounts": accts, "burner_match": bool(accts) and accts[0].lower() == burner_evm().lower()})
 
 def cmd_chainid(a):
     cid = call_walletd("eth_chainId", [], CHAINS[a.chain])
@@ -124,14 +132,14 @@ def cmd_block(a):
     out({"chain": a.chain, "blockNumber": n, "blockNumberDec": int(n, 16)})
 
 def cmd_balance(a):
-    bal = call_walletd("eth_getBalance", [BURNER_EVM, "latest"], CHAINS[a.chain])
+    bal = call_walletd("eth_getBalance", [burner_evm(), "latest"], CHAINS[a.chain])
     wei = int(bal, 16)
-    out({"chain": a.chain, "address": BURNER_EVM,
+    out({"chain": a.chain, "address": burner_evm(),
          "balance_wei": str(wei), "balance": wei / 1e18})
 
 def cmd_nonce(a):
-    n = call_walletd("eth_getTransactionCount", [BURNER_EVM, "pending"], CHAINS[a.chain])
-    out({"chain": a.chain, "address": BURNER_EVM, "nonce": int(n, 16)})
+    n = call_walletd("eth_getTransactionCount", [burner_evm(), "pending"], CHAINS[a.chain])
+    out({"chain": a.chain, "address": burner_evm(), "nonce": int(n, 16)})
 
 def cmd_call(a):
     tx = {"to": a.to, "data": a.data}
@@ -151,16 +159,16 @@ def _recover_evm(message, sig):
 
 def cmd_sign(a):
     msg_hex = "0x" + a.message.encode().hex()
-    sig = call_walletd("personal_sign", [msg_hex, BURNER_EVM])
+    sig = call_walletd("personal_sign", [msg_hex, burner_evm()])
     recovered = _recover_evm(a.message, sig)
-    ok = isinstance(recovered, str) and recovered.lower() == BURNER_EVM.lower()
+    ok = isinstance(recovered, str) and recovered.lower() == burner_evm().lower()
     out({"message": a.message, "signature": sig,
-         "recovered": recovered, "burner": BURNER_EVM, "match": ok})
+         "recovered": recovered, "burner": burner_evm(), "match": ok})
 
 def cmd_sign_typed(a):
     raw = sys.stdin.read() if a.json == "-" else open(a.json).read()
     typed = json.loads(raw)
-    sig = call_walletd("eth_signTypedData_v4", [BURNER_EVM, typed])
+    sig = call_walletd("eth_signTypedData_v4", [burner_evm(), typed])
     # Verifikasi recover EIP-712 lokal bila eth_account tersedia.
     recovered = None
     try:
@@ -178,8 +186,8 @@ def cmd_sign_typed(a):
         recovered = Account.recover_message(signable, signature=sig)
     except Exception as e:
         recovered = "verifikasi gagal: %s" % e
-    ok = isinstance(recovered, str) and recovered.lower() == BURNER_EVM.lower()
-    out({"signature": sig, "recovered": recovered, "burner": BURNER_EVM, "match": ok})
+    ok = isinstance(recovered, str) and recovered.lower() == burner_evm().lower()
+    out({"signature": sig, "recovered": recovered, "burner": burner_evm(), "match": ok})
 
 def cmd_send(a):
     tx = {"to": a.to, "value": hex(int(float(a.value) * 1e18)),
@@ -190,7 +198,7 @@ def cmd_send(a):
         tx["gas"] = hex(a.gas)
     t0 = time.time()
     h = call_walletd("eth_sendTransaction", [tx], CHAINS[a.chain])
-    out({"chain": a.chain, "tx_hash": h, "from": BURNER_EVM, "to": a.to,
+    out({"chain": a.chain, "tx_hash": h, "from": burner_evm(), "to": a.to,
          "value_eth": a.value, "data": a.data or "0x",
          "total_ms": round((time.time() - t0) * 1000, 1),
          "note": "Policy walletd berlaku: auto-approve <=0,5 native, "
@@ -199,7 +207,6 @@ def cmd_send(a):
 def cmd_sol_balance(_):
     lamports = call_walletd("sol_getBalance")
     out({"chain": "solana",
-         "address": "11111111111111111111111111111111",
          "balance_lamports": lamports, "balance_sol": lamports / 1e9})
 
 def cmd_sol_sign(a):
@@ -210,13 +217,11 @@ def cmd_sol_sign(a):
 def cmd_sui_balance(_):
     res = call_walletd("sui_getBalance")
     out({"chain": "sui",
-         "address": "0x0000000000000000000000000000000000000000000000000000000000000000",
          "balance": res})
 
 def cmd_cosmos_balance(_):
     res = call_walletd("cosmos_getBalance")
     out({"chain": "cosmos",
-         "address": "cosmos100000000000000000000000000000000000000",
          "balances": res})
 
 ap = argparse.ArgumentParser(prog="wd",

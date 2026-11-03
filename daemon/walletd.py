@@ -39,8 +39,10 @@ async def fee_refresher():
                 pass
         await asyncio.sleep(12)
 
-SEED_FILE = os.path.expanduser("~/.burner/seed")
-PORT = 18923
+SEED_FILE = os.environ.get("BRAIND_SEED_FILE", os.path.expanduser("~/.burner/seed"))
+PORT = int(os.environ.get("BRAIND_WS_PORT", "18923"))
+HTTP_PORT = int(os.environ.get("BRAIND_HTTP_PORT", "18924"))
+BIND = os.environ.get("BRAIND_BIND", "127.0.0.1")
 LOG = os.path.expanduser("~/workspace/superagentic-wallet/daemon/walletd.log")
 # SOL_RPC is defined per-network in the Solana networking section below
 # (migrated 2026-10-30, fix datahub id 685 — it used to be a single
@@ -214,7 +216,7 @@ def log(msg):
 # a missing/short token file denies ALL HTTP POSTs. The WS path (18923) is
 # NOT covered by this token — it is gated by Brain (brain_gate_ws) and the
 # relay token upstream. The token value is NEVER logged.
-CALLER_TOKEN_FILE = os.path.expanduser("~/.burner/walletd.token")
+CALLER_TOKEN_FILE = os.environ.get("BRAIND_TOKEN_FILE", os.path.expanduser("~/.burner/walletd.token"))
 CALLER_TOKEN_HEADER = "X-Walletd-Token"
 
 def _load_caller_token():
@@ -651,7 +653,7 @@ def policy_check(tx, chain_hex):
 # state dir (brain.py stays the sole writer of intents.jsonl; its
 # load_intents overlays ws_consumed.jsonl so a consumed intent shows as
 # executed and cannot be delivered again over HTTP).
-BRAIN_STATE_DIR = os.path.expanduser("~/workspace/custom-connectors/custom.walletd/state")
+BRAIN_STATE_DIR = os.environ.get("BRAIND_STATE_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state"))
 BRAIN_INTENTS_PATH = os.path.join(BRAIN_STATE_DIR, "intents.jsonl")
 BRAIN_AUDIT_PATH = os.path.join(BRAIN_STATE_DIR, "audit.jsonl")
 BRAIN_CONSUMED_PATH = os.path.join(BRAIN_STATE_DIR, "ws_consumed.jsonl")
@@ -1277,7 +1279,7 @@ async def handle(ws):
             await ws.send(json.dumps({"id": mid, "error": {"code": _code, "message": _message}}))
 
 async def main():
-    log(f"SuperAgentic Wallet Daemon listening on 127.0.0.1:{PORT} (ws) + 18924 (http)")
+    log(f"SuperAgentic Wallet Daemon listening on {BIND}:{PORT} (ws) + {HTTP_PORT} (http)")
     log("AUTH[http] caller token " + ("configured (HTTP POST wajib X-Walletd-Token)"
         if _load_caller_token() else "NOT CONFIGURED — HTTP POST akan ditolak semua (fail-closed)"))
     for _ch in RPCS:
@@ -1562,10 +1564,10 @@ async def main():
             pass
 
     def serve_http():
-        HTTPServer(("127.0.0.1", 18924), H).serve_forever()
+        HTTPServer((BIND, HTTP_PORT), H).serve_forever()
     threading.Thread(target=serve_http, daemon=True).start()
 
-    async with websockets.serve(handle, "127.0.0.1", PORT):
+    async with websockets.serve(handle, BIND, PORT):
         await asyncio.Future()
 
 if __name__ == "__main__":

@@ -41,9 +41,17 @@ import argparse, hashlib, json, os, sys, time, urllib.request, urllib.error, uui
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
-WALLETD_HTTP = "http://127.0.0.1:18924/"
-WALLETD_TOKEN_FILE = os.path.expanduser("~/.burner/walletd.token")
-BURNER_EVM = "0x0000000000000000000000000000000000000000"
+WALLETD_HTTP = os.environ.get("BRAIND_WALLETD_URL", "http://127.0.0.1:18924/")
+WALLETD_TOKEN_FILE = os.environ.get("BRAIND_TOKEN_FILE", os.path.expanduser("~/.burner/walletd.token"))
+_BURNER_EVM = None
+
+def burner_evm():
+    """Alamat EVM daemon ini — ditanyakan ke walletd (eth_requestAccounts),
+    bukan konstanta tertanam. Override manual: BRAIND_SELF_ADDRESS."""
+    global _BURNER_EVM
+    if _BURNER_EVM is None:
+        _BURNER_EVM = os.environ.get("BRAIND_SELF_ADDRESS") or call_walletd("eth_requestAccounts")[0]
+    return _BURNER_EVM
 
 def walletd_headers():
     """Header HTTP walletd termasuk token pemanggil (2026-10-30).
@@ -60,7 +68,7 @@ def walletd_headers():
 WIB = timezone(timedelta(hours=7))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_DIR = os.path.join(os.path.dirname(BASE_DIR), "state")
+STATE_DIR = os.environ.get("BRAIND_STATE_DIR", os.path.join(os.path.dirname(BASE_DIR), "state"))
 POLICY_PATH = os.path.join(STATE_DIR, "brain_policy.json")
 INTENTS_PATH = os.path.join(STATE_DIR, "intents.jsonl")
 AUDIT_PATH = os.path.join(STATE_DIR, "audit.jsonl")
@@ -88,12 +96,11 @@ SIGN_METHODS = ("personal_sign", "eth_signTypedData_v4")
 DEFAULT_POLICY = {
     "version": 3,
     "description": (
-        "Gerbang kebijakan Brain v3 (revisi owner 2 Nov 2026 22:18 WIB): "
-        "SEMUA CAP NILAI DICABUT (cap_wei null di semua chain) dan method "
-        "tanda tangan pesan personal_sign + eth_signTypedData_v4 AKTIF "
-        "(v2, keputusan owner 22:14 WIB). Cap walletd juga dicabut di "
-        "revisi yang sama; yang tersisa adalah gerbang persetujuan intent "
-        "dan allowlist tujuan."
+        "Gerbang kebijakan Brain v3: tanpa cap nilai (cap_wei null "
+        "di semua chain); method tanda tangan pesan personal_sign + "
+        "eth_signTypedData_v4 aktif. Yang menjaga adalah gerbang "
+        "persetujuan intent (propose, approve exact-hash, konsumsi "
+        "satu kali) dan allowlist tujuan."
     ),
     "allowed_methods": ["eth_sendTransaction", "personal_sign",
                         "eth_signTypedData_v4"],
@@ -109,7 +116,7 @@ DEFAULT_POLICY = {
         "polygon":      {"chain_id": CHAINS["polygon"],      "class": "mainnet", "cap_wei": None},
     },
     "destinations": {
-        "self": BURNER_EVM,
+        "self": "",
         # Kontrak testnet Sepolia terdaftar (Uniswap V2 + WETH9).
         "allowlist": [
             "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",
@@ -285,7 +292,7 @@ def call_walletd(method, params=None, chain=None):
         except Exception:
             raise RuntimeError("walletd HTTP %s" % e.code)
     except urllib.error.URLError as e:
-        raise RuntimeError("walletd TIDAK TERJANGKAU di 127.0.0.1:18924 (%s)" % e)
+        raise RuntimeError("walletd TIDAK TERJANGKAU di %s (%s)" % (WALLETD_HTTP, e))
     if data.get("error"):
         err = data["error"]
         raise RuntimeError("walletd error %s: %s" % (err.get("code"), err.get("message")))
@@ -311,7 +318,7 @@ def estimate_gas_limit(tx, chain_hex):
     bila tx tanpa gas — terlalu kecil untuk deploy/LP Sepolia. Baca boleh
     diulang (flake RPC); pengiriman tetap satu kali. None bila estimasi
     tidak tersedia setelah 3x baca."""
-    est_tx = {"from": BURNER_EVM, "data": tx.get("data", "0x"),
+    est_tx = {"from": burner_evm(), "data": tx.get("data", "0x"),
               "value": tx.get("value", "0x0")}
     if tx.get("to"):
         est_tx["to"] = tx["to"]
@@ -330,11 +337,11 @@ def estimate_gas_limit(tx, chain_hex):
 def cmd_check(_):
     status = walletd_http_status()
     res = {"walletd_http": status, "walletd_alive": status == 501,
-           "burner": BURNER_EVM, "chains": {}}
+           "burner": burner_evm(), "chains": {}}
     for name in ("sepolia", "base-sepolia"):
         hexid = CHAINS[name]
         cid = call_walletd("eth_chainId", [], hexid)
-        bal = call_walletd("eth_getBalance", [BURNER_EVM, "latest"], hexid)
+        bal = call_walletd("eth_getBalance", [burner_evm(), "latest"], hexid)
         wei = int(bal, 16)
         res["chains"][name] = {
             "chain_id": cid, "chain_id_dec": int(cid, 16),
@@ -450,7 +457,7 @@ def cmd_propose(a):
         data = "0x"
     else:
         dests = policy.get("destinations", {})
-        self_addr = (dests.get("self") or BURNER_EVM).lower()
+        self_addr = (dests.get("self") or burner_evm()).lower()
         allowlist = [x.lower() for x in dests.get("allowlist", [])]
         if to == CREATE_TO:
             # Deploy kontrak: hanya chain kelas testnet terdaftar, value
@@ -556,7 +563,7 @@ def deliver_sign(rec, base):
     try:
         if rec["method"] == "personal_sign":
             message = rec.get("message") or ""
-            sig = call_walletd("personal_sign", [message, BURNER_EVM],
+            sig = call_walletd("personal_sign", [message, burner_evm()],
                                chain_hex)
             signable = (encode_defunct(hexstr=message)
                         if message.startswith("0x")
@@ -564,7 +571,7 @@ def deliver_sign(rec, base):
             recovered = Account.recover_message(signable, signature=sig)
         else:
             typed = json.loads(rec.get("typed_data") or "{}")
-            sig = call_walletd("eth_signTypedData_v4", [BURNER_EVM, typed],
+            sig = call_walletd("eth_signTypedData_v4", [burner_evm(), typed],
                                chain_hex)
             # eth_account 0.14: full_message dulu; fallback 3-arg tanpa
             # kunci EIP712Domain (pola yang sama seperti walletd).
@@ -580,7 +587,7 @@ def deliver_sign(rec, base):
         write_transition(rec, "execution_failed", note=str(e))
         audit("execution_failed", intent_id=a_id, detail=str(e), **base)
         fail("execution_failed: " + str(e))
-    if recovered.lower() != BURNER_EVM.lower():
+    if recovered.lower() != burner_evm().lower():
         write_transition(rec, "execution_failed",
                          note="recover signature bukan burner: %s" % recovered)
         audit("execution_failed", intent_id=a_id,

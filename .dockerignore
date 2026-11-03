@@ -1,0 +1,7 @@
+.git
+__pycache__
+*.pyc
+braind-data
+state
+*.log
+*.muse-github-snapshot-sync.json

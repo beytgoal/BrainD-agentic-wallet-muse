@@ -1,0 +1,26 @@
+# BrainD Wallet — signer node.
+#
+# Before the first start, create the data directory with your own secrets:
+#   mkdir -p braind-data/state
+#   umask 077; printf '%s' "<your BIP-39 mnemonic>" > braind-data/seed
+#   openssl rand -hex 32 > braind-data/walletd.token
+#   chmod 600 braind-data/seed braind-data/walletd.token
+# (or run ./install.sh, which prepares a native install the same way.)
+#
+# Ports are bound to the host's localhost ONLY. Never publish them:
+# reach the signer from an agent machine through SSH or a private
+# network (WireGuard/Tailscale) — see docs/self-host.md.
+services:
+  signer:
+    build: .
+    container_name: braind-signer
+    restart: unless-stopped
+    environment:
+      BRAIND_SEED_FILE: /data/seed
+      BRAIND_TOKEN_FILE: /data/walletd.token
+      BRAIND_STATE_DIR: /data/state
+    volumes:
+      - ./braind-data:/data
+    ports:
+      - "127.0.0.1:18924:18924"
+      - "127.0.0.1:18923:18923"
