@@ -233,6 +233,229 @@ def caller_authorized(header_value):
         return False
     return hmac.compare_digest(str(header_value).strip(), expected)
 
+# ---- Fase 2: scoped sessions + pairing (self-host, pola Binance Agentic
+# Wallet). The master caller token stays the owner's root credential. On top
+# of it, walletd can issue SCOPED SESSION tokens through a pairing flow:
+#   1. agent  -> braind_pairBegin   (no auth; proposes label/chains/methods)
+#   2. owner  -> braind_pairApprove (master token; CLI pair.py or web
+#      approver) — the ONLY step that creates a session
+#   3. agent  -> braind_pairPoll    (pairing id + secret) receives the
+#      session token exactly once
+# A session token authenticates like the master token on the HTTP path but
+# is restricted to its method allowlist, chain allowlist, and expiry, and
+# can be revoked (braind_revokeSession). Only hashes of tokens/secrets are
+# stored. Sessions/pairings live in <state>/sessions.json. The WS path is
+# unchanged (Brain-gated + relay token, see header note above).
+import threading as _threading
+import secrets
+_SESSIONS_LOCK = _threading.Lock()
+_READ_METHODS = {
+    "eth_call", "eth_getBalance", "eth_chainId", "eth_requestAccounts",
+    "eth_accounts", "net_version", "eth_blockNumber", "eth_gasPrice",
+    "eth_estimateGas", "eth_getTransactionCount", "eth_getTransactionReceipt",
+    "eth_getCode", "eth_getBlockByNumber", "eth_feeHistory",
+}
+_MGMT_METHODS = {"braind_pairApprove", "braind_listSessions",
+                 "braind_listPairings", "braind_revokeSession"}
+_SIGN_METHODS_DEFAULT = ["eth_sendTransaction", "personal_sign",
+                         "eth_signTypedData_v4"]
+
+
+def _sessions_path():
+    state = os.environ.get(
+        "BRAIND_STATE_DIR",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "state"))
+    return os.path.join(state, "sessions.json")
+
+
+def _sessions_load():
+    try:
+        with open(_sessions_path()) as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            d.setdefault("sessions", [])
+            d.setdefault("pairings", {})
+            return d
+    except Exception:
+        pass
+    return {"sessions": [], "pairings": {}}
+
+
+def _sessions_save(d):
+    p = _sessions_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=1)
+    os.replace(tmp, p)
+
+
+def _tok_hash(tok):
+    return hashlib.sha256(str(tok).encode()).hexdigest()
+
+
+def _find_session(header_value):
+    """Return the live session record for a session token, else None."""
+    if not header_value:
+        return None
+    h = _tok_hash(str(header_value).strip())
+    now = time.time()
+    for s in _sessions_load().get("sessions", []):
+        if s.get("revoked"):
+            continue
+        if s.get("expires_ts", 0) <= now:
+            continue
+        if hmac.compare_digest(s.get("token_hash", ""), h):
+            return s
+    return None
+
+
+def _session_scope_ok(sess, method, msg):
+    """Enforce a session's method + chain allowlists on one request."""
+    if method in _READ_METHODS:
+        return True, ""
+    allowed = sess.get("methods", [])
+    if "*" not in allowed and method not in allowed:
+        return False, f"method {method} not in session scope"
+    chains = sess.get("chains", [])
+    if chains and "*" not in chains:
+        raw = msg.get("chain")
+        tx = None
+        params = msg.get("params")
+        if isinstance(params, list) and params and isinstance(params[0], dict):
+            tx = params[0]
+        elif isinstance(params, dict):
+            tx = params
+        if raw is None and tx:
+            raw = tx.get("chainId")
+        if raw is not None:
+            hx = norm_chain_hex(raw)
+            allowed_hex = {norm_chain_hex(c) for c in chains} - {None}
+            if hx is None or hx not in allowed_hex:
+                return False, f"chain {raw} not in session scope"
+    return True, ""
+
+
+def _pair_begin(params):
+    now = time.time()
+    with _SESSIONS_LOCK:
+        d = _sessions_load()
+        pend = [p for p in d["pairings"].values()
+                if p.get("status") == "pending" and p.get("expires_ts", 0) > now]
+        if len(pend) >= 3:
+            return None, "too many pending pairings; approve or wait for expiry"
+        pid = "brd_" + secrets.token_hex(4)
+        secret = secrets.token_urlsafe(24)
+        d["pairings"][pid] = {
+            "secret_hash": _tok_hash(secret),
+            "status": "pending",
+            "created_ts": now,
+            "expires_ts": now + 600,
+            "label": str(params.get("label", "agent"))[:64],
+            "chains": params.get("chains") or ["*"],
+            "methods": params.get("methods") or list(_SIGN_METHODS_DEFAULT),
+            "session_token_once": None,
+            "session_id": None,
+        }
+        _sessions_save(d)
+    return {"pairing_id": pid, "secret": secret, "expires_in": 600}, None
+
+
+def _pair_poll(params):
+    pid = str(params.get("pairing_id", ""))
+    secret = str(params.get("secret", ""))
+    now = time.time()
+    with _SESSIONS_LOCK:
+        d = _sessions_load()
+        p = d["pairings"].get(pid)
+        if not p or not hmac.compare_digest(p.get("secret_hash", ""),
+                                            _tok_hash(secret)):
+            return None, "unknown pairing or bad secret"
+        if p.get("expires_ts", 0) <= now and p.get("status") == "pending":
+            p["status"] = "expired"
+            _sessions_save(d)
+            return {"status": "expired"}, None
+        if p.get("status") == "pending":
+            return {"status": "pending"}, None
+        if p.get("status") == "approved":
+            tok = p.get("session_token_once")
+            if tok:
+                p["session_token_once"] = None
+                _sessions_save(d)
+                return {"status": "approved", "session_token": tok,
+                        "session_id": p.get("session_id")}, None
+            return {"status": "approved", "note": "token already collected"}, None
+        return {"status": p.get("status", "unknown")}, None
+
+
+def _pair_approve(params):
+    pid = str(params.get("pairing_id", ""))
+    now = time.time()
+    with _SESSIONS_LOCK:
+        d = _sessions_load()
+        p = d["pairings"].get(pid)
+        if not p or p.get("status") != "pending":
+            return None, "pairing not pending"
+        if p.get("expires_ts", 0) <= now:
+            p["status"] = "expired"
+            _sessions_save(d)
+            return None, "pairing expired"
+        token = "braind_sess_" + secrets.token_hex(24)
+        ttl_h = float(params.get("ttl_hours", 48))
+        sess = {
+            "id": "sess_" + secrets.token_hex(4),
+            "label": str(params.get("label", p.get("label", "agent")))[:64],
+            "token_hash": _tok_hash(token),
+            "created_ts": now,
+            "expires_ts": now + ttl_h * 3600,
+            "chains": params.get("chains") or p.get("chains") or ["*"],
+            "methods": params.get("methods") or p.get("methods")
+                       or list(_SIGN_METHODS_DEFAULT),
+            "revoked": False,
+        }
+        d["sessions"].append(sess)
+        p["status"] = "approved"
+        p["session_token_once"] = token
+        p["session_id"] = sess["id"]
+        _sessions_save(d)
+    return {"session_id": sess["id"], "expires_ts": sess["expires_ts"],
+            "chains": sess["chains"], "methods": sess["methods"]}, None
+
+
+def _mgmt_dispatch(method, params):
+    """Master-token-only Fase 2 management methods. Returns (result, error)."""
+    if method == "braind_pairApprove":
+        return _pair_approve(params)
+    if method == "braind_listSessions":
+        out = []
+        for s in _sessions_load().get("sessions", []):
+            out.append({k: s.get(k) for k in
+                        ("id", "label", "created_ts", "expires_ts", "chains",
+                         "methods", "revoked")})
+        return out, None
+    if method == "braind_listPairings":
+        now = time.time()
+        out = []
+        for pid, p in _sessions_load().get("pairings", {}).items():
+            out.append({"pairing_id": pid, "status": p.get("status"),
+                        "label": p.get("label"), "chains": p.get("chains"),
+                        "methods": p.get("methods"),
+                        "expires_in": max(0, int(p.get("expires_ts", 0) - now))})
+        return out, None
+    if method == "braind_revokeSession":
+        sid = str(params.get("session_id", ""))
+        with _SESSIONS_LOCK:
+            d = _sessions_load()
+            for s in d["sessions"]:
+                if s.get("id") == sid:
+                    s["revoked"] = True
+                    _sessions_save(d)
+                    return {"revoked": sid}, None
+        return None, "unknown session_id"
+    return None, "unknown management method"
+
+
 def seed():
     with open(SEED_FILE) as f:
         return f.read().strip()
@@ -1294,24 +1517,71 @@ async def main():
     parent_handle = handle
 
     class H(BaseHTTPRequestHandler):
+        def _send_json(self, obj, status=200):
+            out = json.dumps(obj).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
-            if not caller_authorized(self.headers.get(CALLER_TOKEN_HEADER)):
-                log("AUTH[http] DENY caller token missing/invalid")
-                out = json.dumps({"id": None, "result": None, "error": {
-                    "code": -32001,
-                    "message": "unauthorized: valid X-Walletd-Token header required"}}).encode()
-                self.send_response(401)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(out)))
-                self.end_headers()
-                self.wfile.write(out)
-                return
             try:
                 msg = json.loads(body)
             except Exception:
                 self.send_response(400); self.end_headers(); return
+            method = msg.get("method")
+            params = msg.get("params") or {}
+            if isinstance(params, list):
+                params = params[0] if params and isinstance(params[0], dict) else {}
+            # Fase 2 pairing: begin/poll are authenticated by the pairing
+            # secret itself, never by a wallet token.
+            if method in ("braind_pairBegin", "braind_pairPoll"):
+                fn = _pair_begin if method == "braind_pairBegin" else _pair_poll
+                res, err = fn(params)
+                if err:
+                    self._send_json({"id": msg.get("id"), "result": None,
+                                     "error": {"code": -32010, "message": err}})
+                else:
+                    self._send_json({"id": msg.get("id"), "result": res,
+                                     "error": None})
+                return
+            header_tok = self.headers.get(CALLER_TOKEN_HEADER)
+            if caller_authorized(header_tok):
+                if method in _MGMT_METHODS:
+                    res, err = _mgmt_dispatch(method, params)
+                    if err:
+                        self._send_json({"id": msg.get("id"), "result": None,
+                                         "error": {"code": -32011,
+                                                   "message": err}})
+                    else:
+                        self._send_json({"id": msg.get("id"), "result": res,
+                                         "error": None})
+                    return
+                # master token: fall through to normal dispatch below
+            else:
+                sess = _find_session(header_tok)
+                if sess is None:
+                    log("AUTH[http] DENY caller token missing/invalid")
+                    self._send_json({"id": None, "result": None, "error": {
+                        "code": -32001,
+                        "message": "unauthorized: valid X-Walletd-Token header required"}}, status=401)
+                    return
+                if method in _MGMT_METHODS:
+                    self._send_json({"id": msg.get("id"), "result": None,
+                                     "error": {"code": -32003,
+                                               "message": "session tokens cannot manage sessions"}}, status=403)
+                    return
+                ok, why = _session_scope_ok(sess, method, msg)
+                if not ok:
+                    log(f"AUTH[http] session {sess.get('id')} scope DENY {method}: {why}")
+                    self._send_json({"id": msg.get("id"), "result": None,
+                                     "error": {"code": -32003,
+                                               "message": f"session scope denied: {why}"}}, status=403)
+                    return
+                log(f"REQ[http] via session {sess.get('id')} ({sess.get('label')})")
             # run the WS handler logic synchronously via a fake ws
             result = {}
             class FakeWS:
