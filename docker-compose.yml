@@ -24,3 +24,23 @@ services:
     ports:
       - "127.0.0.1:18924:18924"
       - "127.0.0.1:18923:18923"
+
+  # Optional web approver (Fase 2): approve Brain intents and pairings,
+  # manage sessions. Start with: docker compose --profile approver up -d
+  approver:
+    build: .
+    container_name: braind-approver
+    restart: unless-stopped
+    profiles: ["approver"]
+    command: ["python", "bin/approver.py"]
+    environment:
+      BRAIND_WALLETD_URL: http://signer:18924
+      BRAIND_TOKEN_FILE: /data/walletd.token
+      BRAIND_STATE_DIR: /data/state
+      BRAIND_APPROVER_BIND: 0.0.0.0
+    volumes:
+      - ./braind-data:/data
+    ports:
+      - "127.0.0.1:18926:18926"
+    depends_on:
+      - signer

@@ -94,6 +94,16 @@ then never touches the agent machine. Topology, configuration reference
 `BRAIND_STATE_DIR`, `BRAIND_BIND`, ports) and the security rules live in
 [docs/self-host.md](docs/self-host.md).
 
+## Pairing & scoped sessions (Fase 2)
+
+Agents don't need the master token. Following the Binance Agentic Wallet
+pattern, an agent **pairs** with the signer: it requests a pairing, the owner
+approves it (CLI `bin/pair.py` or the web approver `bin/approver.py`), and the
+agent receives a **scoped session token** — restricted to specific chains,
+methods, and an expiry, revocable at any time. The web approver also handles
+Brain intent approvals from the browser. Full guide:
+[docs/pairing-and-sessions.md](docs/pairing-and-sessions.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
