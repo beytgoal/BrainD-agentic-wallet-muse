@@ -127,7 +127,7 @@ async def login(request):
         resp = web.HTTPFound("/")
         resp.set_cookie("braind_auth",
                         hashlib.sha256(tok.encode()).hexdigest(),
-                        httponly=True)
+                        httponly=True, samesite="Strict")
         return resp
     return web.Response(text=page("login gagal", "ERR token salah"),
                         content_type="text/html")
@@ -249,8 +249,20 @@ async def intent_reject(request):
     return web.HTTPFound(f"/?msg={out or 'rejected'}")
 
 
+@web.middleware
+async def same_origin_only(request, handler):
+    """CSRF guard: state-changing requests must not come from another origin."""
+    if request.method == "POST":
+        origin = request.headers.get("Origin")
+        if origin:
+            from urllib.parse import urlparse
+            if urlparse(origin).netloc != request.headers.get("Host", ""):
+                raise web.HTTPForbidden(text="cross-origin request refused")
+    return await handler(request)
+
+
 def main():
-    app = web.Application()
+    app = web.Application(middlewares=[same_origin_only])
     app.router.add_get("/", home)
     app.router.add_post("/login", login)
     app.router.add_post("/pairing/approve", pairing_approve)

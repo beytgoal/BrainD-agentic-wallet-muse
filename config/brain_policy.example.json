@@ -11,7 +11,7 @@
       "class": "testnet"
     },
     "base": {
-      "cap_wei": null,
+      "cap_wei": 10000000000000000,
       "chain_id": "0x2105",
       "class": "mainnet"
     },
@@ -21,7 +21,7 @@
       "class": "testnet"
     },
     "bsc": {
-      "cap_wei": null,
+      "cap_wei": 10000000000000000,
       "chain_id": "0x38",
       "class": "mainnet"
     },
@@ -36,12 +36,12 @@
       "class": "testnet"
     },
     "ethereum": {
-      "cap_wei": null,
+      "cap_wei": 10000000000000000,
       "chain_id": "0x1",
       "class": "mainnet"
     },
     "polygon": {
-      "cap_wei": null,
+      "cap_wei": 10000000000000000,
       "chain_id": "0x89",
       "class": "mainnet"
     },
@@ -51,7 +51,7 @@
       "class": "testnet"
     }
   },
-  "description": "Example Brain policy. Replace the destination allowlist and self address with your own before use.",
+  "description": "Example Brain policy. Replace the destination allowlist and self address with your own before use. Mainnet chains ship with a 0.01 native-token cap per transaction; raise it deliberately.",
   "destinations": {
     "allowlist": [],
     "self": "0x0000000000000000000000000000000000000000"

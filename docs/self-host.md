@@ -60,6 +60,11 @@ need approval at the gate.
 | `BRAIND_BIND` | `127.0.0.1` | walletd bind address |
 | `BRAIND_HTTP_PORT` | `18924` | walletd HTTP port |
 | `BRAIND_WS_PORT` | `18923` | walletd WebSocket port (browser extension) |
+| `BRAIND_LOG_FILE` | `~/.braind/walletd.log` | daemon log file (directory is created) |
+| `BRAIND_APPROVAL_KEY_FILE` | unset | HMAC key; when set, intents need a valid approval signature |
+| `BRAIND_ALLOWED_ORIGINS` | unset | comma list of WS origins (default: any `chrome-extension://`) |
+| `BRAIND_PAIRING_ENABLED` | unset (OFF) | pairing/session creation switch; exactly `1` = ON, anything else = OFF (fail-closed; existing sessions unaffected) |
+| `BRAIND_POLICY_ENABLED` | unset (ON) | Brain policy gate switch; exactly `0` = OFF (agent autonomous, no per-tx owner approval), anything else = ON |
 | `BRAIND_WALLETD_URL` | `http://127.0.0.1:18924/` | where brain.py / wd.py reach walletd |
 
 ## Security rules that are not optional

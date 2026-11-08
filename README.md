@@ -30,8 +30,9 @@ agent / CLI ──► Brain (intent gate) ──► walletd (signing daemon) ─
 - **`bin/price_oracle.py`** — keyless USD prices from on-chain Chainlink feeds.
 - **`extension/`** — a Chrome MV3 extension that injects an EIP-1193 provider
   (`window.ethereum`, plus Solana/Sui providers) backed by the daemon, so dApps
-  detect the wallet like any browser wallet. Origin allowlist; signing stays in
-  the daemon.
+  detect the wallet like any browser wallet. The provider is injected on every
+  site (`<all_urls>`); only the Elysium-specific provider is limited to an
+  allowlist of hosts. Signing stays in the daemon and is gated by Brain.
 
 ## Chains
 
@@ -50,6 +51,40 @@ agent / CLI ──► Brain (intent gate) ──► walletd (signing daemon) ─
   signing path.
 - Fees follow the chain's own gas price; when the chain suggestion is below the
   pending block's base fee, the daemon lifts it to exactly the base fee.
+
+## Hardening (read before using real funds)
+
+- **Value cap**: mainnet chains ship with `cap_wei` = 0.01 native token per
+  transaction. It is enforced by `brain.py propose` **and** by the daemon
+  (including scoped sessions, which also get an optional
+  `pair.py approve --max-value-wei`). Raise it deliberately in
+  `state/brain_policy.json`. Sessions are also limited to the policy's
+  destination allowlist.
+- **Approval signature (strongly recommended on mainnet)**: set
+  `BRAIND_APPROVAL_KEY_FILE` (>= 32 random chars, mode 0600) for the signer
+  and for whoever runs `brain.py approve` / the approver — **not** for the
+  agent. Intents without a valid `approval_sig` are then refused, so an agent
+  that can write to `state/` cannot forge or self-approve an intent.
+- **The agent must not be able to write `state/`, `brain_policy.json`, the
+  token file or the key file.** Run the signer as a separate OS user or on a
+  separate machine (docs/self-host.md, Mode B). If the agent can edit the
+  policy, the caps are decoration.
+- **WebSocket/HTTP**: the WS server refuses web-page Origins (only
+  `chrome-extension://` or origins in `BRAIND_ALLOWED_ORIGINS`; pin your
+  extension id there). The HTTP API refuses any request with an `Origin`
+  header and sends no CORS headers.
+- Not covered: typed-data/message signatures can authorise token spending
+  (e.g. permits) without moving native value, so do not give agents sessions
+  with signing methods on mainnet; the code is still unaudited.
+
+## Cloud agents (Meta Muse) — relay + puller
+
+Cloud agents cannot reach the signer and cannot load the extension. `relay/`
+adds a public proposal inbox (`relay_server.py`, holds no keys) and a
+signer-side `puller.py` that fetches proposals over outbound HTTPS and feeds
+them into Brain. The agent can only *propose*; you still approve. Setup,
+the Muse connector prompt and the mainnet checklist:
+[docs/muse-connector.md](docs/muse-connector.md).
 
 ## Status
 
@@ -93,6 +128,9 @@ then never touches the agent machine. Topology, configuration reference
 (everything is environment-driven: `BRAIND_SEED_FILE`, `BRAIND_TOKEN_FILE`,
 `BRAIND_STATE_DIR`, `BRAIND_BIND`, ports) and the security rules live in
 [docs/self-host.md](docs/self-host.md).
+
+Running inside the Muse VM (watchdog-supervised, no systemd, pairing and
+policy on/off switches): [docs/deploy-vm-muse.md](docs/deploy-vm-muse.md).
 
 ## Pairing & scoped sessions (Fase 2)
 

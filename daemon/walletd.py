@@ -43,7 +43,7 @@ SEED_FILE = os.environ.get("BRAIND_SEED_FILE", os.path.expanduser("~/.burner/see
 PORT = int(os.environ.get("BRAIND_WS_PORT", "18923"))
 HTTP_PORT = int(os.environ.get("BRAIND_HTTP_PORT", "18924"))
 BIND = os.environ.get("BRAIND_BIND", "127.0.0.1")
-LOG = os.path.expanduser("~/workspace/superagentic-wallet/daemon/walletd.log")
+LOG = os.environ.get("BRAIND_LOG_FILE", os.path.expanduser("~/.braind/walletd.log"))
 # SOL_RPC is defined per-network in the Solana networking section below
 # (migrated 2026-10-30, fix datahub id 685 — it used to be a single
 # hardcoded MAINNET URL here, so every sol_* read silently hit mainnet).
@@ -200,13 +200,23 @@ def error_code(msg):
     Returns (code, message); code is -32000 when there is no numeric prefix."""
     if len(msg) > 5 and msg[4] == ":" and msg[:4].isdigit():
         return int(msg[:4]), msg[5:].lstrip()
+    # Fase 3: negative JSON-RPC server-error codes written as
+    # "-32006: simulation failed: ..." are parsed back into their code.
+    if msg.startswith("-"):
+        _head, _sep, _rest = msg.partition(":")
+        if _sep and _head[1:].isdigit():
+            return int(_head), _rest.lstrip()
     return -32000, msg
 
 def log(msg):
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
     print(line, flush=True)
-    with open(LOG, "a") as f:
-        f.write(line + "\n")
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass  # logging must never crash the signer (stdout still has the line)
 
 # ---- Caller token for the local HTTP bridge (2026-10-30, perintah owner:
 # tutup temuan TINGGI uji keamanan BrainD — bypass Brain via POST langsung
@@ -246,6 +256,8 @@ def caller_authorized(header_value):
 # can be revoked (braind_revokeSession). Only hashes of tokens/secrets are
 # stored. Sessions/pairings live in <state>/sessions.json. The WS path is
 # unchanged (Brain-gated + relay token, see header note above).
+# Pairing switch (owner): creation of new pairings/sessions is gated
+# by BRAIND_PAIRING_ENABLED == "1" (default OFF, fail-closed).
 import threading as _threading
 import secrets
 _SESSIONS_LOCK = _threading.Lock()
@@ -259,6 +271,28 @@ _MGMT_METHODS = {"braind_pairApprove", "braind_listSessions",
                  "braind_listPairings", "braind_revokeSession"}
 _SIGN_METHODS_DEFAULT = ["eth_sendTransaction", "personal_sign",
                          "eth_signTypedData_v4"]
+
+
+def _pairing_enabled():
+    """Pairing switch (owner rule): the pairing flow is ACTIVE only
+    when BRAIND_PAIRING_ENABLED is exactly "1". Unset or any other
+    value = OFF (fail-closed, arah v2). The switch closes only the
+    CREATION of new pairings/sessions; sessions that already exist
+    keep working and the master token is unaffected."""
+    return os.environ.get("BRAIND_PAIRING_ENABLED") == "1"
+
+
+def _policy_enabled():
+    """Policy switch (owner rule): the Brain policy gate is ON unless
+    BRAIND_POLICY_ENABLED is exactly "0". ON = owner-gated (intent
+    approval, approval_sig, value cap + destination allowlist,
+    session value/destination scope). OFF = agent autonomous: intent
+    matching, approval_sig, cap/allowlist and session value/
+    destination scope are skipped. NEVER skipped in either mode:
+    caller-token auth, session token validity/revocation, the
+    BLOCKED denylist, foreign-chain rejection (4902) and the Fase 3
+    pre-signing simulation (anti-revert pre-flight, not policy)."""
+    return os.environ.get("BRAIND_POLICY_ENABLED") != "0"
 
 
 def _sessions_path():
@@ -318,6 +352,24 @@ def _session_scope_ok(sess, method, msg):
     allowed = sess.get("methods", [])
     if "*" not in allowed and method not in allowed:
         return False, f"method {method} not in session scope"
+    if method == "eth_sendTransaction":
+        _p = msg.get("params")
+        _tx = _p[0] if isinstance(_p, list) and _p and isinstance(_p[0], dict) \
+            else (_p if isinstance(_p, dict) else {})
+        try:
+            _chx = resolve_chain_hint(msg.get("chain") or _tx.get("chainId"))
+        except Exception as e:
+            return False, f"chain not supported: {e}"
+        if _policy_enabled():
+            _cap = sess.get("max_value_wei")
+            try:
+                if _cap is not None and _ws_value_wei(_tx) > int(_cap):
+                    return False, f"value exceeds session cap {_cap} wei"
+            except Exception:
+                return False, "unparseable value"
+            _ok, _why = policy_limits_ok(_tx, _chx, enforce_dest=True)
+            if not _ok:
+                return False, _why
     chains = sess.get("chains", [])
     if chains and "*" not in chains:
         raw = msg.get("chain")
@@ -390,6 +442,8 @@ def _pair_poll(params):
 
 
 def _pair_approve(params):
+    if not _pairing_enabled():
+        return None, "pairing disabled"
     pid = str(params.get("pairing_id", ""))
     now = time.time()
     with _SESSIONS_LOCK:
@@ -412,6 +466,8 @@ def _pair_approve(params):
             "chains": params.get("chains") or p.get("chains") or ["*"],
             "methods": params.get("methods") or p.get("methods")
                        or list(_SIGN_METHODS_DEFAULT),
+            "max_value_wei": (str(int(params["max_value_wei"]))
+                              if params.get("max_value_wei") is not None else None),
             "revoked": False,
         }
         d["sessions"].append(sess)
@@ -834,6 +890,76 @@ def rpc_call_chain(chain_hex, method, params=[]):
         f"rpc transport failure on all endpoints for chain {chain_hex} "
         f"method {method}: {last_err}")
 
+def _policy_load():
+    try:
+        with open(BRAIN_POLICY_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def policy_limits_ok(tx, chain_hex, enforce_dest=False):
+    """Daemon-side enforcement of the Brain policy (value cap, and for
+    session callers the destination allowlist). Previously these limits were
+    only checked by `brain.py propose`; a scoped session talking straight to
+    the daemon bypassed them. Returns (ok, reason). Fail-closed on any
+    parse problem."""
+    if not _policy_enabled():
+        return True, ""
+    try:
+        pol = _policy_load()
+        name = _brain_chain_name(chain_hex)
+        info = (pol.get("chains") or {}).get(name or "", {})
+        value = _ws_value_wei(tx)
+        if value < 0:
+            return False, "negative value"
+        cap = info.get("cap_wei")
+        if cap is not None and value > int(cap):
+            return False, f"value {value} wei exceeds policy cap {cap} wei on {name}"
+        if enforce_dest:
+            to = (tx.get("to") or "").lower()
+            if not to:  # contract creation: testnet only, value 0
+                if info.get("class") != "testnet" or value != 0:
+                    return False, "contract creation only on testnet with value 0"
+            else:
+                dests = pol.get("destinations") or {}
+                self_addr = (dests.get("self") or acct().address).lower()
+                allow = {x.lower() for x in (dests.get("allowlist") or [])}
+                if to != self_addr and to not in allow:
+                    return False, f"destination {to} not in policy allowlist"
+        return True, ""
+    except Exception as e:
+        return False, f"policy check error: {e}"
+
+# ---- Approval signature (opt-in, recommended for mainnet) ----
+# When BRAIND_APPROVAL_KEY_FILE is set, an intent only counts as "approved"
+# if its record carries approval_sig = HMAC-SHA256(key, "id|hash|approved"),
+# written by `brain.py approve`. The key must be readable by the signer and
+# the human approver but NOT by the agent; then an agent that can append to
+# intents.jsonl still cannot forge or self-approve an intent.
+APPROVAL_KEY_FILE = os.environ.get("BRAIND_APPROVAL_KEY_FILE")
+
+def _approval_key():
+    if not APPROVAL_KEY_FILE:
+        return None
+    try:
+        with open(APPROVAL_KEY_FILE) as f:
+            k = f.read().strip()
+        return k.encode() if len(k) >= 32 else b""
+    except Exception:
+        return b""
+
+def _approval_sig_ok(rec):
+    if not _policy_enabled():
+        return True          # policy OFF: approval_sig tidak dituntut
+    key = _approval_key()
+    if key is None:
+        return True          # feature not enabled (legacy behaviour)
+    if not key:
+        return False         # configured but unreadable/short: fail closed
+    want = hmac.new(key, f"{rec.get('intent_id')}|{rec.get('intent_hash')}|approved".encode(),
+                    hashlib.sha256).hexdigest()
+    return hmac.compare_digest(str(rec.get("approval_sig", "")), want)
+
 def policy_check(tx, chain_hex):
     """Returns (approved: bool, reason: str).
 
@@ -844,6 +970,9 @@ def policy_check(tx, chain_hex):
     to = (tx.get("to") or "").lower()
     if to in BLOCKED:
         return False, "address denylisted"
+    ok, why = policy_limits_ok(tx, chain_hex)   # value cap from brain_policy.json
+    if not ok:
+        return False, why
     return True, "within policy"
 
 # ---- Brain single gate for the WS / extension path (2026-10-30, perintah owner) ----
@@ -980,19 +1109,16 @@ def _ws_value_wei(tx):
         return int(v, 16) if v.startswith(("0x", "0X")) else int(v)
     return int(v)
 
-def brain_gate_ws(chain_hex, tx):
-    """Brain gate for an eth_sendTransaction arriving via WS/extension.
-    Returns the consumed intent record on success. Raises RuntimeError
-    'brain approval required: ...' when no approved, unconsumed intent
-    matches the request exactly. Callers run inside the asyncio loop and
-    this check + marker append contain no awaits, so check-and-consume
-    cannot interleave with another WS request in this process."""
+def _brain_find_tx_intent(chain_hex, tx):
+    """Fase 3 refactor: the matching half of brain_gate_ws, WITHOUT
+    consuming. Returns (chain_name, match, want_hash); chain_name is None
+    when the chain is not registered in Brain, match is None when no
+    approved, unconsumed intent matches the request exactly. Used by the
+    pre-signing simulation to peek at the intent it protects, and by
+    brain_gate_ws itself (find + consume, behaviour unchanged)."""
     chain_name = _brain_chain_name(chain_hex)
     if chain_name is None:
-        log(f"BRAIN-GATE DENY method=eth_sendTransaction chain={chain_hex} "
-            f"alasan=chain tidak terdaftar di Brain")
-        raise RuntimeError(
-            f"brain approval required: chain {chain_hex} is not registered in Brain")
+        return None, None, None
     to_norm = "CREATE" if not tx.get("to") else str(tx.get("to"))
     data = tx.get("data") or "0x"
     value_wei = str(_ws_value_wei(tx))
@@ -1007,12 +1133,37 @@ def brain_gate_ws(chain_hex, tx):
             continue
         if rec.get("intent_hash") != want:
             continue
+        if not _approval_sig_ok(rec):
+            continue
         # Re-verify the stored hash from the record's own fields
         # (exact-match discipline, same as brain.py deliver).
         if _brain_intent_hash_any(rec) != rec["intent_hash"]:
             continue
         match = rec
         break
+    return chain_name, match, want
+
+
+def brain_gate_ws(chain_hex, tx):
+    """Brain gate for an eth_sendTransaction arriving via WS/extension.
+    Returns the consumed intent record on success. Raises RuntimeError
+    'brain approval required: ...' when no approved, unconsumed intent
+    matches the request exactly. Callers run inside the asyncio loop and
+    this check + marker append contain no awaits, so check-and-consume
+    cannot interleave with another WS request in this process."""
+    if not _policy_enabled():
+        log(f"POLICY-OFF sign: eth_sendTransaction chain={chain_hex} "
+            f"to={tx.get('to')} value_wei={_ws_value_wei(tx)} "
+            f"tanpa intent (policy OFF)")
+        return None
+    chain_name, match, want = _brain_find_tx_intent(chain_hex, tx)
+    if chain_name is None:
+        log(f"BRAIN-GATE DENY method=eth_sendTransaction chain={chain_hex} "
+            f"alasan=chain tidak terdaftar di Brain")
+        raise RuntimeError(
+            f"brain approval required: chain {chain_hex} is not registered in Brain")
+    to_norm = "CREATE" if not tx.get("to") else str(tx.get("to"))
+    value_wei = str(_ws_value_wei(tx))
     if match is None:
         log(f"BRAIN-GATE DENY method=eth_sendTransaction chain={chain_name} "
             f"to={to_norm} value_wei={value_wei} hash={want[:12]} "
@@ -1033,6 +1184,79 @@ def brain_gate_ws(chain_hex, tx):
         f"to={to_norm} value_wei={value_wei}")
     return match
 
+# ---- Fase 3: pre-signing simulation (eth_call) for eth_sendTransaction ----
+# Before an approved intent is consumed / a transaction is signed, the
+# EXACT transaction (from, to, value, data) is executed once via eth_call
+# against the target chain's RPC. A revert or any eth_call error rejects
+# the request with JSON-RPC error -32006 ("simulation failed") BEFORE any
+# consumption or signature — the intent stays approved and unconsumed, so
+# a fixed request can be retried against the same approval. The outcome
+# is recorded per intent in simulations.jsonl (Brain state dir) and in
+# the Brain audit log (events simulation_passed / simulation_failed).
+# Simulation applies ONLY to eth_sendTransaction: personal_sign and
+# eth_signTypedData_v4 sign an off-chain payload — there is no on-chain
+# state transition to simulate, so eth_call is not applicable there and
+# those paths intentionally skip this step (see brain_gate_ws_sign).
+BRAIN_SIM_PATH = os.path.join(BRAIN_STATE_DIR, "simulations.jsonl")
+SIM_FAILED_PREFIX = "-32006: simulation failed: "
+
+
+def _sim_call_tx(tx, from_addr):
+    """The exact eth_call parameter object for a pending transaction."""
+    call_tx = {"from": from_addr,
+               "value": hex(_ws_value_wei(tx)),
+               "data": tx.get("data") or "0x"}
+    if tx.get("to"):
+        call_tx["to"] = tx["to"]
+    return call_tx
+
+
+def _brain_record_simulation(rec, chain_name, tx, sim, via):
+    """Persist one simulation outcome: simulations.jsonl (keyed by
+    intent_id when an intent matched) + a Brain audit line."""
+    _brain_append_jsonl(BRAIN_SIM_PATH, {
+        "ts": _brain_now_iso(),
+        "intent_id": rec.get("intent_id") if rec else None,
+        "intent_hash": rec.get("intent_hash") if rec else None,
+        "chain": chain_name, "method": "eth_sendTransaction",
+        "to": tx.get("to"), "value_wei": str(_ws_value_wei(tx)),
+        "data": tx.get("data") or "0x", "via": via,
+        "simulation": {"ok": sim["ok"], "result": sim.get("result"),
+                       "error": sim.get("error")},
+    })
+    if rec is not None:
+        brain_audit_ws("simulation_passed" if sim["ok"] else "simulation_failed",
+                       rec,
+                       detail=("simulasi eth_call lolos via=%s" % via) if sim["ok"]
+                              else ("simulasi eth_call GAGAL via=%s: %s"
+                                    % (via, sim.get("error"))))
+    log(f"SIMULATION {'PASS' if sim['ok'] else 'FAIL'} via={via} "
+        f"chain={chain_name} to={tx.get('to')} "
+        f"value_wei={_ws_value_wei(tx)}"
+        + ("" if sim["ok"] else f" error={sim.get('error')}"))
+
+
+def brain_simulate_tx_sync(chain_hex, tx, from_addr):
+    """Synchronous eth_call simulation (HTTP path). Returns
+    {"ok": bool, "result": ..., "error": ...}; never raises."""
+    try:
+        res = rpc_call_chain(chain_hex, "eth_call",
+                             [_sim_call_tx(tx, from_addr), "latest"])
+        return {"ok": True, "result": res, "error": None}
+    except Exception as e:
+        return {"ok": False, "result": None, "error": str(e)}
+
+
+async def brain_simulate_tx(chain_hex, tx, from_addr):
+    """Async eth_call simulation (WS path, fast client). Same contract
+    as brain_simulate_tx_sync; never raises."""
+    try:
+        res = await fast_client(chain_hex).call(
+            "eth_call", [_sim_call_tx(tx, from_addr), "latest"])
+        return {"ok": True, "result": res, "error": None}
+    except Exception as e:
+        return {"ok": False, "result": None, "error": str(e)}
+
 def brain_gate_ws_sign(chain_hex, method, payload):
     """Brain gate for a message-signing request arriving via WS/extension
     (Brain v2, keputusan owner 2026-11-02 22:14 WIB). `payload` is the
@@ -1041,7 +1265,17 @@ def brain_gate_ws_sign(chain_hex, method, payload):
     success. Raises RuntimeError 'brain approval required: ...' when no
     approved, unconsumed sign intent covers this exact payload. The
     intent is consumed BEFORE signing (fail-closed against replay) —
-    signing on this path is never free or auto-approved."""
+    signing on this path is never free or auto-approved.
+    Fase 3 note: the pre-signing eth_call simulation does NOT apply to
+    personal_sign / eth_signTypedData_v4 — they sign an off-chain payload
+    and cause no on-chain state transition, so there is nothing for
+    eth_call to execute. Simulation guards eth_sendTransaction only."""
+    if not _policy_enabled():
+        log(f"POLICY-OFF sign: {method} tanpa intent (policy OFF)")
+        return {"intent_id": None, "caller": "policy-off",
+                "chain": _brain_chain_name(chain_hex), "method": method,
+                "to": None, "value_wei": None,
+                "reason": "POLICY-OFF: policy disabled, sign tanpa intent"}
     chain_name = _brain_chain_name(chain_hex)
     if chain_name is None:
         log(f"BRAIN-GATE DENY method={method} chain={chain_hex} "
@@ -1059,6 +1293,8 @@ def brain_gate_ws_sign(chain_hex, method, payload):
         if rec.get("method") != method:
             continue
         if rec.get("intent_hash") != want:
+            continue
+        if not _approval_sig_ok(rec):
             continue
         if _brain_intent_hash_any(rec) != rec["intent_hash"]:
             continue
@@ -1145,7 +1381,31 @@ async def dex_swap_prepare(fc, address, router, token_in, token_out, amount_in_w
                   "slippageBps": slippage_bps},
     }
 
+def _ws_origin_ok(ws):
+    """Reject WebSocket connections that come from a web page.
+    Browsers always send an Origin header on WS handshakes and CORS does not
+    protect WebSockets, so without this ANY site could talk to the daemon.
+    Allowed: no Origin (CLI / local tools), chrome-extension:// origins, or
+    the exact origins listed in BRAIND_ALLOWED_ORIGINS (comma separated;
+    when set it REPLACES the chrome-extension default, so pin your extension
+    id, e.g. chrome-extension://abcdef...)."""
+    try:
+        hdrs = ws.request.headers
+    except AttributeError:
+        hdrs = getattr(ws, "request_headers", {})
+    origin = hdrs.get("Origin")
+    if not origin:
+        return True
+    pinned = [o.strip() for o in os.environ.get("BRAIND_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+    if pinned:
+        return origin in pinned
+    return origin.startswith("chrome-extension://")
+
 async def handle(ws):
+    if not _ws_origin_ok(ws):
+        log("AUTH[ws] DENY origin not allowed")
+        await ws.close(1008, "origin not allowed")
+        return
     ac = acct()
     address = ac.address
     log(f"extension connected from {ws.remote_address}")
@@ -1201,6 +1461,20 @@ async def handle(ws):
                              (isinstance(_raw_chain, str) and not _raw_chain.strip()))
                 chain_hex = chain_hint if _no_chain else resolve_chain_hint(_raw_chain)
                 url, cid = RPCS[chain_hex]
+                # Fase 3 pre-signing simulation: when an approved intent
+                # matches this transaction, execute the EXACT tx once via
+                # eth_call BEFORE the intent is consumed or anything is
+                # signed. Revert/error -> -32006, intent NOT consumed.
+                # (No matching intent -> the gate below rejects as before;
+                # there is no approved intent to simulate against.)
+                _sim_chain, _sim_rec, _sim_want = _brain_find_tx_intent(chain_hex, tx)
+                # Policy OFF: simulasi TETAP jalan walau tanpa intent
+                # (pre-flight anti-revert, bukan bagian approval policy).
+                if _sim_rec is not None or not _policy_enabled():
+                    _sim = await brain_simulate_tx(chain_hex, tx, address)
+                    _brain_record_simulation(_sim_rec, _sim_chain or chain_hex, tx, _sim, via="ws")
+                    if not _sim["ok"]:
+                        raise RuntimeError(SIM_FAILED_PREFIX + str(_sim["error"]))
                 # Brain single gate (2026-10-30): extension/WS sends need a
                 # matching approved Brain intent, consumed before signing.
                 # Raises RuntimeError 'brain approval required: ...' when
@@ -1503,6 +1777,14 @@ async def handle(ws):
 
 async def main():
     log(f"SuperAgentic Wallet Daemon listening on {BIND}:{PORT} (ws) + {HTTP_PORT} (http)")
+    if not APPROVAL_KEY_FILE:
+        log("WARN approval signature NOT enabled (set BRAIND_APPROVAL_KEY_FILE "
+            "to stop an agent with state-dir write access from forging approvals)")
+    log("PAIRING ENABLED (BRAIND_PAIRING_ENABLED=1)" if _pairing_enabled()
+        else "PAIRING DISABLED (set BRAIND_PAIRING_ENABLED=1 to enable; "
+             "existing sessions unaffected)")
+    log("POLICY MODE: ON (owner-gated)" if _policy_enabled()
+        else "POLICY MODE: OFF (agent autonomous — approvals NOT required)")
     log("AUTH[http] caller token " + ("configured (HTTP POST wajib X-Walletd-Token)"
         if _load_caller_token() else "NOT CONFIGURED — HTTP POST akan ditolak semua (fail-closed)"))
     for _ch in RPCS:
@@ -1526,6 +1808,14 @@ async def main():
             self.wfile.write(out)
 
         def do_POST(self):
+            # Browser pages always send Origin. The HTTP API is for local
+            # CLI tools only, so refuse anything that looks browser-made
+            # (blocks drive-by pairBegin / CSRF from web pages).
+            if self.headers.get("Origin"):
+                log("AUTH[http] DENY browser Origin header present")
+                self._send_json({"id": None, "result": None, "error": {
+                    "code": -32001, "message": "browser origins are not allowed"}}, status=403)
+                return
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             try:
@@ -1539,6 +1829,13 @@ async def main():
             # Fase 2 pairing: begin/poll are authenticated by the pairing
             # secret itself, never by a wallet token.
             if method in ("braind_pairBegin", "braind_pairPoll"):
+                if not _pairing_enabled():
+                    log(f"AUTH[http] DENY {method}: pairing disabled "
+                        f"(BRAIND_PAIRING_ENABLED != 1)")
+                    self._send_json({"id": msg.get("id"), "result": None,
+                                     "error": {"code": -32007,
+                                               "message": "pairing disabled"}})
+                    return
                 fn = _pair_begin if method == "braind_pairBegin" else _pair_poll
                 res, err = fn(params)
                 if err:
@@ -1628,6 +1925,18 @@ async def main():
                         ok, reason = policy_check(tx, chain_hex)
                         if not ok:
                             raise RuntimeError(f"policy denied: {reason}")
+                        # Fase 3 pre-signing simulation (HTTP path, the
+                        # path brain.py deliver uses): execute the EXACT
+                        # tx once via eth_call before signing; a
+                        # revert/error rejects with -32006 and nothing is
+                        # signed. Recorded against the matching approved
+                        # intent when one exists (peek only — the HTTP
+                        # path's intent lifecycle stays brain.py's).
+                        _sim_chain, _sim_rec, _sim_want = _brain_find_tx_intent(chain_hex, tx)
+                        _sim = brain_simulate_tx_sync(chain_hex, tx, address)
+                        _brain_record_simulation(_sim_rec, _sim_chain or chain_hex, tx, _sim, via="http")
+                        if not _sim["ok"]:
+                            raise RuntimeError(SIM_FAILED_PREFIX + str(_sim["error"]))
                         t0 = time.time()
                         if "nonce" not in tx:
                             tx["nonce"] = int(rpc_call_chain(chain_hex, "eth_getTransactionCount", [address, "pending"]), 16)
@@ -1820,15 +2129,12 @@ async def main():
             out = json.dumps({"id": data["id"], "result": data.get("result"), "error": data.get("error")}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(out)))
             self.end_headers()
             self.wfile.write(out)
         def do_OPTIONS(self):
-            self.send_response(200)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Walletd-Token")
+            # No CORS: the HTTP API is not meant to be called from web pages.
+            self.send_response(403)
             self.end_headers()
         def log_message(self, *a):
             pass

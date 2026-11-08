@@ -1,0 +1,8 @@
+# /etc/caddy/Caddyfile  (replace the domain; its DNS A record must point at this VPS)
+relay.example.com {
+    encode gzip
+    request_body {
+        max_size 32KB
+    }
+    reverse_proxy 127.0.0.1:18930
+}

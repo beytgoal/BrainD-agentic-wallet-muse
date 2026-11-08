@@ -1,0 +1,25 @@
+# SIGNER machine. Install to /etc/systemd/system/braind-puller.service
+# Runs as the same user that owns the signer's state dir (brain.py needs it).
+# Edit User, paths and RELAY_URL. Drop --auto-deliver to execute manually.
+[Unit]
+Description=BrainD relay puller
+After=network-online.target braind.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME_signer_user
+WorkingDirectory=/home/CHANGE_ME_signer_user/braind-wallet
+Environment=RELAY_URL=https://relay.example.com
+Environment=RELAY_PULLER_KEY_FILE=/home/CHANGE_ME_signer_user/.braind/relay_puller.key
+Environment=BRAIND_STATE_DIR=/home/CHANGE_ME_signer_user/braind-wallet/state
+Environment=BRAIND_TOKEN_FILE=/home/CHANGE_ME_signer_user/.braind/walletd.token
+# Environment=BRAIND_APPROVAL_KEY_FILE=/home/CHANGE_ME_signer_user/.braind/approval.key
+ExecStart=/home/CHANGE_ME_signer_user/braind-wallet/.venv/bin/python relay/puller.py --auto-deliver
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

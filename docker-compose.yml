@@ -19,6 +19,10 @@ services:
       BRAIND_SEED_FILE: /data/seed
       BRAIND_TOKEN_FILE: /data/walletd.token
       BRAIND_STATE_DIR: /data/state
+      # Must listen on all interfaces INSIDE the container, otherwise the
+      # published ports (and the approver container) cannot reach it. The
+      # host side stays 127.0.0.1-only via the ports mapping below.
+      BRAIND_BIND: 0.0.0.0
     volumes:
       - ./braind-data:/data
     ports:

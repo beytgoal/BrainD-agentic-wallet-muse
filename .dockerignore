@@ -5,3 +5,4 @@ braind-data
 state
 *.log
 *.muse-github-snapshot-sync.json
+relay/

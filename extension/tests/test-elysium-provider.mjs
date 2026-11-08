@@ -71,8 +71,8 @@ function requestAndAnswer(world, args, result) {
   const world = makeWorld();
   const eth = world.window.ethereum;
   assert.ok(eth, 'window.ethereum should be set');
-  assert.equal(eth.isBrowserWallet, true);
-  assert.equal(eth.isMetaMask, false);
+  assert.equal(eth.isBrowserWallet, false); // provider identifies as MetaMask on purpose (see elysium_provider.js)
+  assert.equal(eth.isMetaMask, true);
   assert.equal(eth.chainId, '0x185d9');
   assert.equal(eth.networkVersion, '99801');
   assert.ok(world.dispatched.includes('ethereum#initialized'), 'ethereum#initialized dispatched');
@@ -105,7 +105,7 @@ function requestAndAnswer(world, args, result) {
   const world = makeWorld({ existingEthereum: existing });
   assert.equal(world.window.ethereum, existing);
   assert.ok(world.window.browserWallet, 'window.browserWallet should be set');
-  assert.equal(world.window.browserWallet.isBrowserWallet, true);
+  assert.equal(world.window.browserWallet.__sawElysium, true);
   console.log('install (wallet already present) -> window.browserWallet, no clobber OK');
   world.cleanup();
 }

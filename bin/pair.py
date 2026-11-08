@@ -88,6 +88,7 @@ def cmd_approve(a):
         "chains": [c.strip() for c in a.chains.split(",") if c.strip()] or None,
         "methods": [m.strip() for m in a.methods.split(",") if m.strip()] or None,
         "ttl_hours": a.ttl_hours,
+        "max_value_wei": a.max_value_wei,
     }, token=master_token())
     print(json.dumps(res, indent=1))
 
@@ -144,6 +145,8 @@ def main():
     p.add_argument("--chains", default="")
     p.add_argument("--methods", default="")
     p.add_argument("--ttl-hours", type=float, default=48)
+    p.add_argument("--max-value-wei", default=None,
+                   help="per-transaction value cap for this session (wei)")
     p.set_defaults(fn=cmd_approve)
     p = sub.add_parser("poll")
     p.add_argument("--pairing-id", required=True)

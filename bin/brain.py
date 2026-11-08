@@ -96,8 +96,8 @@ SIGN_METHODS = ("personal_sign", "eth_signTypedData_v4")
 DEFAULT_POLICY = {
     "version": 3,
     "description": (
-        "Gerbang kebijakan Brain v3: tanpa cap nilai (cap_wei null "
-        "di semua chain); method tanda tangan pesan personal_sign + "
+        "Gerbang kebijakan Brain v3: cap nilai default 0.01 token native "
+        "di chain mainnet (naikkan sengaja di file ini bila perlu), testnet tanpa cap; method tanda tangan pesan personal_sign + "
         "eth_signTypedData_v4 aktif. Yang menjaga adalah gerbang "
         "persetujuan intent (propose, approve exact-hash, konsumsi "
         "satu kali) dan allowlist tujuan."
@@ -110,10 +110,10 @@ DEFAULT_POLICY = {
         "bsc-testnet":  {"chain_id": CHAINS["bsc-testnet"],  "class": "testnet", "cap_wei": None},
         "amoy":         {"chain_id": CHAINS["amoy"],         "class": "testnet", "cap_wei": None},
         "elysium":      {"chain_id": CHAINS["elysium"],      "class": "testnet", "cap_wei": None},
-        "bsc":          {"chain_id": CHAINS["bsc"],          "class": "mainnet", "cap_wei": None},
-        "ethereum":     {"chain_id": CHAINS["ethereum"],     "class": "mainnet", "cap_wei": None},
-        "base":         {"chain_id": CHAINS["base"],         "class": "mainnet", "cap_wei": None},
-        "polygon":      {"chain_id": CHAINS["polygon"],      "class": "mainnet", "cap_wei": None},
+        "bsc":          {"chain_id": CHAINS["bsc"],          "class": "mainnet", "cap_wei": 10**16},
+        "ethereum":     {"chain_id": CHAINS["ethereum"],     "class": "mainnet", "cap_wei": 10**16},
+        "base":         {"chain_id": CHAINS["base"],         "class": "mainnet", "cap_wei": 10**16},
+        "polygon":      {"chain_id": CHAINS["polygon"],      "class": "mainnet", "cap_wei": 10**16},
     },
     "destinations": {
         "self": "",
@@ -239,9 +239,40 @@ def load_intents():
     return latest, order
 
 
+APPROVAL_KEY_FILE = os.environ.get("BRAIND_APPROVAL_KEY_FILE")
+
+def _approval_key():
+    """None = feature off. Configured but unreadable/short -> fail closed."""
+    if not APPROVAL_KEY_FILE:
+        return None
+    try:
+        with open(APPROVAL_KEY_FILE) as f:
+            k = f.read().strip()
+    except OSError as e:
+        fail("BRAIND_APPROVAL_KEY_FILE configured but unreadable: %s" % e)
+    if len(k) < 32:
+        fail("BRAIND_APPROVAL_KEY_FILE too short (need >= 32 chars)")
+    return k.encode()
+
+def approval_sig(rec):
+    import hmac
+    key = _approval_key()
+    if key is None:
+        return None
+    return hmac.new(key, ("%s|%s|approved" % (rec["intent_id"], rec["intent_hash"])).encode(),
+                    hashlib.sha256).hexdigest()
+
+def approval_sig_ok(rec):
+    import hmac
+    want = approval_sig(rec)
+    return want is None or hmac.compare_digest(str(rec.get("approval_sig", "")), want)
+
+
 def write_transition(rec, status, actor=None, note=None, tx_hash=None,
-                     signature=None):
+                     signature=None, approval_sig=None):
     new = dict(rec)
+    if approval_sig is not None:
+        new["approval_sig"] = approval_sig
     new["status"] = status
     new["ts"] = now_iso()
     if actor is not None:
@@ -529,7 +560,8 @@ def cmd_approve(a):
                      % (a.hash, rec["intent_hash"]), **base)
         fail("approval_rejected: intent_hash tidak sama persis "
              "(diberikan %s, tersimpan %s)" % (a.hash, rec["intent_hash"]))
-    new = write_transition(rec, "approved", actor=a.by)
+    new = write_transition(rec, "approved", actor=a.by,
+                           approval_sig=approval_sig(rec))
     audit("approved", intent_id=a.id, actor=a.by,
           detail="exact-match terverifikasi: intent_hash=" + rec["intent_hash"],
           **base)
@@ -612,6 +644,10 @@ def cmd_deliver(a):
               detail="status intent bukan approved: %s" % rec["status"], **base)
         fail("deliver_rejected: status intent bukan approved: %s"
              % rec["status"])
+    if not approval_sig_ok(rec):
+        audit("deliver_rejected", intent_id=a.id,
+              detail="approval_sig tidak valid / hilang", **base)
+        fail("deliver_rejected: approval signature invalid or missing")
     # Verifikasi ulang intent_hash dari data tersimpan (exact-match).
     recomputed = intent_hash_of(rec["chain"], rec["method"], rec["to"],
                                 rec["value_wei"], rec["data"],
